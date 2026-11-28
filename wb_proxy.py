@@ -23104,6 +23104,57 @@ def stream_responses_events(upstream, model, holder):
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
+def _accepts_gzip(header_value):
+    """Accept-Encoding 里是否明确接受 gzip（q=0 视为拒绝）。
+
+    只找 gzip 这一项：面板首页只需要决定「压不压」，不需要做内容协商的
+    优先级排序；没写 gzip 或写了 q=0 就按不接受处理，退回原始字节。
+    """
+    for part in str(header_value or "").split(","):
+        token, _, params = part.partition(";")
+        if token.strip().lower() != "gzip":
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            name, _, value = param.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        return quality > 0
+    return False
+
+
+_DASHBOARD_GZIP_LOCK = threading.Lock()
+# 首页压缩体按身份表示的校验符缓存：文件 / 面板语言 / 默认出口不变时，
+# 那份 1.6MB 的 HTML 只在第一次被 gzip 客户端请求时压一次。
+_DASHBOARD_GZIP_CACHE = {}
+
+
+def _dashboard_gzip(etag, body):
+    """把首页压成 gzip 字节；压缩失败返回 None，调用方退回未压缩。"""
+    with _DASHBOARD_GZIP_LOCK:
+        cached = _DASHBOARD_GZIP_CACHE.get(etag)
+    if cached is not None:
+        return cached
+    try:
+        # 用 GzipFile 而不是 gzip.compress(..., mtime=0)：后者到 3.11 才接受
+        # mtime，而本仓库要兼容 3.9。mtime=0 让同一份输入产出稳定字节。
+        buffer = io.BytesIO()
+        with gzip.GzipFile(fileobj=buffer, mode="wb", compresslevel=6,
+                           mtime=0) as out:
+            out.write(body)
+        packed = buffer.getvalue()
+    except Exception:
+        return None
+    with _DASHBOARD_GZIP_LOCK:
+        if len(_DASHBOARD_GZIP_CACHE) >= 4:
+            _DASHBOARD_GZIP_CACHE.clear()
+        _DASHBOARD_GZIP_CACHE[etag] = packed
+    return packed
+
+
 def _if_none_match_hit(header_value, etag):
     """If-None-Match 头是否命中给定的 ETag。
 
@@ -25584,33 +25635,13 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "no such key", "invalid_request_error")
 
     def _dashboard(self):
-        try:
-            with open(DASHBOARD_HTML, "rb") as fh:
-                body = fh.read()
-        except Exception as exc:
-            return self._error(500, f"dashboard.html unavailable: {exc}")
-        # The static file carries a placeholder; replace it with the instance
-        # default so the first paint already uses the right language.
+        # 注入值先定下来：ETag 覆盖它们，而 304 校验要在读文件之前完成——
+        # 否则每次「只是回来校验一下」的打开都要白读一遍 1.6MB。
         language = wb_settings.ui_language(ACCOUNTS_DIR)
-        body = body.replace(
-            b'data-ui-language="__WB_UI_LANGUAGE__"',
-            ('data-ui-language="%s"' % language).encode("utf-8"),
-        )
         # Snapshot the persisted exit for the first paint and for the ETag.
         # The view selector follows its own state, including ?view= overrides.
         realm = CURRENT_REALM
         realm_label = {"codearts": "CodeArts", "cn": "国内版"}.get(realm)
-        if realm_label:
-            body = body.replace(b'data-gateway-realm="intl"',
-                                ('data-gateway-realm="%s"' % realm).encode("ascii"), 1)
-            body = body.replace(
-                '<span id="headerRealmName">国际版</span>'.encode("utf-8"),
-                ('<span id="headerRealmName">%s</span>' % realm_label).encode("utf-8"), 1)
-        # 面板首页是纯静态资源（服务端逐字节原样发出、不含任何机密），所以可以
-        # 允许浏览器存储副本、每次打开再回源校验：校验命中回 304（无 body），
-        # 省下整页（约 470KB）的重复下载，手机 / Tailscale 远程访问体感最明显。
-        #
-        # 文件、面板语言或默认出口任一变化时，浏览器都要重新读取首页。
         etag = None
         try:
             st = os.stat(DASHBOARD_HTML)
@@ -25621,15 +25652,22 @@ class Handler(BaseHTTPRequestHandler):
             # stat 取不到（或时间戳无法表示）不是致命错误：退化为一律按普通
             # 200 处理，只是这一次没有条件请求支持，绝不让面板页本身打不开。
             etag = None
+        # 传输侧再叠一层 gzip：页面本身不动、不压缩源文件，只在浏览器接受时发
+        # 压缩体。gzip 变体与原始字节是两份不同的表示，所以它的校验符带 -gzip
+        # 后缀，两种编码的 304 校验互不串用；Vary 让沿途缓存分开存。
+        use_gzip = _accepts_gzip(self.headers.get("Accept-Encoding"))
+        response_etag = etag
+        if etag is not None and use_gzip:
+            response_etag = etag[:-1] + '-gzip"'
         # 只认 If-None-Match，不发送、也不理会 If-Modified-Since。Last-Modified
         # 只能描述文件的 mtime，而响应体还取决于语言：日期无法表达这个输入，
         # 一旦发布出去，偏好日期的客户端就会拿它校验，语言一变就拿到过期的
         # 304。ETag 覆盖全部输入、单靠它就足够完备，所以干脆不提供日期——
         # 不发布它，客户端就没有用它的理由（RFC 7232 §2.2 里 Last-Modified 只是
         # SHOULD，响应体并非单一文件、没有可一致表达的修改日期，只发 ETag 完备）。
-        if etag is not None:
+        if response_etag is not None:
             inm = self.headers.get("If-None-Match")
-            if inm is not None and _if_none_match_hit(inm, etag):
+            if inm is not None and _if_none_match_hit(inm, response_etag):
                 # 304 不带 body：浏览器手里已有一份，一个字节都不用再传。也不带
                 # Content-Length：304 按 RFC 7230 §3.3.3 在空行处结束，再报全量
                 # 长度反而会诱使客户端 / 代理等待一个永远不会来的 body。校验符和
@@ -25637,21 +25675,55 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(304)
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("X-Robots-Tag", "noindex, nofollow")
-                self.send_header("ETag", etag)
+                self.send_header("Vary", "Accept-Encoding")
+                self.send_header("ETag", response_etag)
                 self.end_headers()
                 return
+        try:
+            with open(DASHBOARD_HTML, "rb") as fh:
+                body = fh.read()
+        except Exception as exc:
+            return self._error(500, f"dashboard.html unavailable: {exc}")
+        # The static file carries a placeholder; replace it with the instance
+        # default so the first paint already uses the right language.
+        body = body.replace(
+            b'data-ui-language="__WB_UI_LANGUAGE__"',
+            ('data-ui-language="%s"' % language).encode("utf-8"),
+        )
+        if realm_label:
+            body = body.replace(b'data-gateway-realm="intl"',
+                                ('data-gateway-realm="%s"' % realm).encode("ascii"), 1)
+            body = body.replace(
+                '<span id="headerRealmName">国际版</span>'.encode("utf-8"),
+                ('<span id="headerRealmName">%s</span>' % realm_label).encode("utf-8"), 1)
+        # 面板首页是纯静态资源（服务端逐字节原样发出、不含任何机密），所以可以
+        # 允许浏览器存储副本、每次打开再回源校验：校验命中回 304（无 body），
+        # 省下整页的重复下载，手机 / Tailscale 远程访问体感最明显。
+        payload = body
+        content_encoding = None
+        if use_gzip:
+            packed = _dashboard_gzip(etag or ("anon-%d" % len(body)), body)
+            if packed is not None:
+                payload = packed
+                content_encoding = "gzip"
+        if content_encoding is None and etag is not None:
+            # 压缩失败退回原始字节：校验符也得退回身份表示的那一个。
+            response_etag = etag
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(payload)))
+        if content_encoding:
+            self.send_header("Content-Encoding", content_encoding)
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("X-Robots-Tag", "noindex, nofollow")
         # no-cache 而不是 no-store：允许存储，但每次使用前必须回源校验；配合
         # 上面的校验符，校验命中的代价是一次 304 而不是整页约 470KB。不加
         # max-age：没有它浏览器每次打开都会校验，应用更新后新版页面立即生效。
         self.send_header("Cache-Control", "no-cache")
-        if etag is not None:
-            self.send_header("ETag", etag)
+        if response_etag is not None:
+            self.send_header("ETag", response_etag)
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(payload)
     def _read_chunked_body(self, max_bytes=MAX_PAYLOAD_BYTES):
         """Decode a Transfer-Encoding: chunked body into bytes.
 

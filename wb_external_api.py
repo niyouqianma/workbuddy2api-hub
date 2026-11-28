@@ -388,25 +388,54 @@ def record_call(usage_dir, row):
         _compact_call_log(_call_log_path(usage_dir))
 
 
+_BACKWARD_CHUNK = 64 * 1024
+
+
+def _lines_backward(path, chunk=_BACKWARD_CHUNK):
+    """从 `path` 尾部按块往回读，逐行产出（最新在前）。
+
+    调用记录是追加写的（record_call 每次追加一行），读的又总是「最新的一页」，
+    所以不必把整份文件读成列表再倒序：拿到够用的行就停止迭代，更老的字节
+    根本不会被读出来。空行跳过；没有换行的尾部残行照常产出。
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            buf = b""
+            while pos > 0:
+                step = min(chunk, pos)
+                pos -= step
+                fh.seek(pos)
+                buf = fh.read(step) + buf
+                parts = buf.split(b"\n")
+                buf = parts[0]
+                for raw in reversed(parts[1:]):
+                    if raw.strip():
+                        yield raw
+            if buf.strip():
+                yield buf
+    except (FileNotFoundError, OSError):
+        return
+
+
 def recent_calls(usage_dir, limit=100):
     try:
         limit = max(1, min(CALL_LOG_MAX_RECORDS, int(limit)))
     except (TypeError, ValueError):
         limit = 100
-    path = _call_log_path(usage_dir)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            rows = []
-            for line in fh:
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict):
-                    rows.append(row)
-        return list(reversed(rows[-limit:]))
-    except (FileNotFoundError, OSError):
-        return []
+    rows = []
+    # 只要最新的 limit 条：从尾部读到够数就停，文件再长也只读尾部那一段。
+    for raw in _lines_backward(_call_log_path(usage_dir)):
+        try:
+            row = json.loads(raw)
+        except (UnicodeError, ValueError):
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+    return rows
 
 
 def recent_calls_page(usage_dir, page=1, page_size=20):
@@ -421,26 +450,28 @@ def recent_calls_page(usage_dir, page=1, page_size=20):
         page_size = 20
 
     path = _call_log_path(usage_dir)
-    rows = []
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict):
-                    rows.append(row)
-    except (FileNotFoundError, OSError):
-        rows = []
+    need = page * page_size
+    newest = []
+    total = 0
+    # 一次反向扫描同时拿到两样东西：最新的 need 条记录（解析成字典）与总行数。
+    # 更老的行只需计数、不用解析，所以页深不会把整份文件都变成 json.loads。
+    # 总行数按「非空行」计：这份日志只由 record_call 追加，一行就是一条记录。
+    for raw in _lines_backward(path):
+        total += 1
+        if len(newest) >= need:
+            continue
+        try:
+            row = json.loads(raw)
+        except (UnicodeError, ValueError):
+            continue
+        if isinstance(row, dict):
+            newest.append(row)
 
-    ordered = list(reversed(rows))
-    total = len(ordered)
     pages = max(1, (total + page_size - 1) // page_size)
     page = min(page, pages)
     start = (page - 1) * page_size
     return {
-        "records": ordered[start:start + page_size],
+        "records": newest[start:start + page_size],
         "page": page,
         "page_size": page_size,
         "total": total,

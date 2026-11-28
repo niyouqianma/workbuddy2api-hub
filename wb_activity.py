@@ -262,6 +262,41 @@ def load(usage_dir=None):
     return _read_rows(path)
 
 
+# 反向读的块大小：一块通常够放几十上百条记录，读完够用的行就停，剩余字节不读。
+_BACKWARD_CHUNK = 64 * 1024
+
+
+def _lines_backward(path, chunk=_BACKWARD_CHUNK):
+    """从文件尾部按块往回读，逐行产出（最新在前）。
+
+    与 _read_rows() 不同：它不把整份文件先读成列表，调用方拿到够用的行就可以
+    停止迭代，剩下的（更老的）字节根本不会被读出来。空行跳过；没有换行的尾
+    部残行照常产出（与逐行读的口径一致）。
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            buf = b""
+            while pos > 0:
+                step = min(chunk, pos)
+                pos -= step
+                fh.seek(pos)
+                buf = fh.read(step) + buf
+                parts = buf.split(b"\n")
+                buf = parts[0]
+                for raw in reversed(parts[1:]):
+                    if raw.strip():
+                        yield raw
+            if buf.strip():
+                yield buf
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _log("读取失败: %s" % exc)
+        return
+
+
 def local_midnight(now=None):
     """本地日历零点的 epoch。
 
@@ -314,10 +349,21 @@ def query(range_key=None, uid=None, task=None, result=None, limit=None,
     limit = max(1, min(MAX_LIMIT, limit))
 
     uid = (uid or "").strip()
-    matched = []
-    # 文件是追加写的，追加序就是时间序，倒过来即最新在前。
-    for raw in reversed(load(usage_dir=usage_dir)):
-        row = project(raw)
+    rows = []
+    total = 0
+    # 文件是追加写的，追加序就是时间序。从尾部按块往回读：命中行一够 limit
+    # 就只差 total 了，而 total 必须精确（面板的「共 N 条 / 加载更多」靠它），
+    # 所以一直数到 range 下界为止——更老的行都在窗口外，再往前不会再有命中。
+    # 这样默认窗口（7d / 30d）只读最近那一段，不再每次都把 90 天的文件读一遍。
+    path = os.path.join(usage_dir, HISTORY_NAME) if usage_dir else history_path()
+    for raw in _lines_backward(path):
+        try:
+            item = json.loads(raw)
+        except (UnicodeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        row = project(item)
         if uid and row["uid"] != uid:
             continue
         if task and row["task"] != task:
@@ -326,12 +372,16 @@ def query(range_key=None, uid=None, task=None, result=None, limit=None,
             continue
         if cutoff is not None:
             ts = _parse_ts(row["ts"])
-            # 有界区间里，时间读不出来或缺失的行不能算「在区间内」：那样一条坏行
-            # 就能绕过 cutoff。range=all 没有下界，也就不存在绕过。
-            if ts is None or ts < cutoff:
+            # 时间读不出来或缺失的行不能算「在区间内」，但它也不证明更老的行
+            # 都在窗口外（文件可能被手工补行），所以只跳过、不据此停手。
+            if ts is None:
                 continue
-        matched.append(row)
-    return {"rows": matched[:limit], "total": len(matched), "limit": limit,
+            if ts < cutoff:
+                break
+        total += 1
+        if len(rows) < limit:
+            rows.append(row)
+    return {"rows": rows, "total": total, "limit": limit,
             "range": key,
             "filters": {"uid": uid, "task": task, "result": result}}
 
